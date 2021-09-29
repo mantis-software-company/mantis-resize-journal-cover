@@ -1,0 +1,54 @@
+#!/usr/bin/env python
+
+import io
+import os
+import logging
+import psycopg2
+import requests
+from psycopg2.extras import LoggingConnection
+from PIL import Image
+
+logging.basicConfig(level=logging.getLevelName(os.environ.get("LOG_LEVEL", "DEBUG")))
+logger = logging.getLogger(__name__)
+
+conn = psycopg2.connect(
+    connection_factory=LoggingConnection,
+    host=os.environ.get("DB_HOST"),
+    port=os.environ.get("DB_PORT", 5432),
+    user=os.environ.get("DB_USER"),
+    password=os.environ.get("DB_PASS"),
+    database=os.environ.get("DB_DATABASE")
+)
+
+conn.initialize(logger)
+conn.autocommit = True
+
+cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+with open(os.environ.get("COVER_SELECT_SQL_PATH")) as sqlfile:
+    cur.execute(sqlfile.read())
+
+rows = cur.fetchall()
+
+file_service_api_url = os.environ.get("FILE_SERVICE_API_URL")
+
+for row in rows:
+    key = row["cover_path_s3"]
+    cover_url = f"{file_service_api_url}/download/{key}"
+    r = requests.get(cover_url)
+    try:
+        image = Image.open(io.BytesIO(r.content))
+        resized_image = image.resize((70, 100), Image.LANCZOS)
+        resized_image.save(f"cover_paths/{key}.png", optimize=True, quality=65)
+        upload_url = f"{file_service_api_url}/upload"
+        with open(f"cover_paths/{key}.png", 'rb') as f:
+            r = requests.post(upload_url, files={"file": (f"{key}.png", f, "image/png")})
+            r = r.json()
+            with open(os.environ.get("COVER_UPDATE_SQL_PATH")) as sqlfile:
+                cur.execute(sqlfile.read(), (r["key"], key,))
+    except Exception as e:
+        # If file is unreadable by Pillow for some reason (broken file or unsupported file type)
+        # this script removes their keys from db.
+        with open(os.environ.get("COVER_REMOVE_SQL_PATH")) as sqlfile:
+            cur.execute(sqlfile.read(), (key,))
+
